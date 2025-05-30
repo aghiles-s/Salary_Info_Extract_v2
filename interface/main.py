@@ -1,30 +1,95 @@
-import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 import streamlit as st
-from datetime import datetime
-from app.ingestion import load_file
-from app.ollama_extractor import extract_entities
-from app.comparator import compare_documents
-from app.utils import validate_data_for_comparison
+import fitz  # PyMuPDF
+import os
+import json
+import requests
+from pathlib import Path
 
-st.set_page_config(page_title="🧠 Analyse intelligente de documents", layout="centered")
-st.title("📁 Analyse automatique de documents financiers")
+OLLAMA_URL = "http://48.220.32.10:11434/api/generate"
+MODEL_NAME = "mistral"
 
-# Créer les dossiers nécessaires
-if not os.path.exists("data/raw"):
-    os.makedirs("data/raw")
-if not os.path.exists("data/json"):
-    os.makedirs("data/json")
-if not os.path.exists("data/csv"):
-    os.makedirs("data/csv")
+def extract_text_from_pdf_file(file):
+    with fitz.open(stream=file.read(), filetype="pdf") as doc:
+        text = "\n".join(page.get_text() for page in doc)
+    return text
+
+def analyze_text_with_ollama(text):
+    prompt = f"""
+    Tu es un assistant expert en lecture de fiches de paie.
+
+    Analyse le texte ci-dessous et retourne un JSON avec les champs suivants **seulement s'ils sont clairement présents** :
+    - nom
+    - prénom
+    - poste
+    - entreprise
+    - salaire net (ou net à payer)
+    
+
+    ⚠️ Très important :
+    - N'invente jamais d'information.
+    - Si un champ est absent ou ambigu, mets `null` ou ne l'inclus pas dans le JSON.
+    - Le champ "salaire" doit être un nombre sans texte (ex: 2450, pas "2450 euros").
+    - Identifier le **salaire net** même s’il est appelé autrement : "Net payé en euros", "Net à payer", "Salaire net", "Salaire net à payer", "Rémunération nette", etc.Si plusieurs valeurs similaires existent, prends celle qui est la **plus proche du montant réellement versé au salarié**.
+
+    Retourne uniquement un objet JSON comme ci-dessous :
+
+    {{
+      "nom": "...",
+      "prenom": "...",
+      "poste": "...",
+      "entreprise": "...",
+      "salaire": 2450
+    }}
+    - N'invente jamais d'information.
+    
+    Voici le texte extrait :
+    {text}
+    """
+
+    response = requests.post(OLLAMA_URL, json={
+        "model": MODEL_NAME,
+        "prompt": prompt,
+        "stream": False
+    })
+
+    response.raise_for_status()
+    generated = response.json()["response"]
+
+    try:
+        data = json.loads(generated)
+    except json.JSONDecodeError:
+        st.error("Erreur de parsing JSON : réponse Mistral invalide.")
+        st.code(generated)
+        return None
+
+    return data
+
+def save_to_db(data, db_path="data/json/db.json"):
+    db_file = Path(db_path)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if db_file.exists():
+        with open(db_file, "r") as f:
+            db = json.load(f)
+    else:
+        db = []
+
+    db.append(data)
+
+    with open(db_file, "w") as f:
+        json.dump(db, f, indent=2)
+
+# ---------- Interface Streamlit ----------
+
+st.set_page_config(page_title="📊 Analyse de documents financiers", layout="centered")
+
+st.title("📊 Analyse de Fiches de Paie & Simulation d'Emprunt")
 
 st.markdown("""
 Déposez jusqu'à **5 fichiers PDF** (fiches de paie, relevés bancaires, etc.).  
 Puis cliquez sur **Analyser** pour :
-- Détecter les informations clés
-- Comparer automatiquement les documents
-- Identifier toute incohérence
+- Extraire les informations clés
+- Calculer votre capacité d'emprunt mensuelle et totale
 """)
 
 uploaded_files = st.file_uploader(
@@ -33,76 +98,65 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-if "docs_data" not in st.session_state:
-    st.session_state.docs_data = []
+# Slider pour durée d'emprunt
+loan_years = st.slider(
+    "📆 Choisissez la durée de l'emprunt (en années)",
+    min_value=5,
+    max_value=30,
+    value=20,
+    step=1
+)
 
 if uploaded_files:
     if len(uploaded_files) > 5:
-        st.warning("⚠️ Vous ne pouvez charger que 5 documents au maximum.")
-    else:
-        st.session_state.docs_data = uploaded_files
+        st.warning("⚠️ Vous avez déposé plus de 5 fichiers. Seuls les 5 premiers seront analysés.")
+        uploaded_files = uploaded_files[:5]
 
-if st.button("🚀 Analyser les documents") and st.session_state.docs_data:
-    st.info("⏳ Traitement en cours... Veuillez patienter.")
+    if st.button("🔍 Analyser"):
+        for i, file in enumerate(uploaded_files, 1):
+            st.markdown(f"---\n### 📄 Document {i}: `{file.name}`")
 
-    docs_data = []
-    for idx, file in enumerate(st.session_state.docs_data):
-        try:
-            temp_path = f"data/raw/temp_doc_{idx}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
-            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
-            with open(temp_path, "wb") as f:
-                st.success(f"✅ Fichier {file.name} chargé avec succès.")
-                f.write(file.read())
+            try:
+                text = extract_text_from_pdf_file(file)
+                with st.expander("📝 Voir le texte brut extrait du PDF"):
+                    st.text(text)
+                data = analyze_text_with_ollama(text)
 
-            text = "\n".join(load_file(temp_path))
-            extracted = extract_entities(text)
+                if data:
+                    # 🔢 Calcul local : mensualité & montant max
+                    try:
+                        salaire = float(data.get("salaire", 0))
+                        mensualite = round(salaire * 0.33, 2)
+                        montant_total = round(mensualite * 12 * loan_years, 2)
 
-            docs_data.append({
-                "nom": file.name,
-                "texte": text,
-                "data": extracted
-            })
+                        # Construire nom complet
+                        nom = data.get("nom", "")
+                        prenom = data.get("prenom", "")
+                        nom_complet = f"{prenom} {nom}".strip()
 
-            os.remove(temp_path)
-        except Exception as e:
-            st.error(f"❌ Erreur avec le fichier {file.name} : {e}")
+                        # Préparer structure finale pour db.json
+                        data_finale = {
+                            "nom_complet": nom_complet if nom_complet else None,
+                            "poste": data.get("poste"),
+                            "entreprise": data.get("entreprise"),
+                            "salaire": salaire,
+                            "mensualite_max": mensualite,
+                            "montant_max_empruntable": montant_total,
+                            "duree_emprunt_annees": loan_years
+                        }
 
-    # ✅ Affichage du texte extrait + lien de téléchargement
-    st.subheader("📄 Textes extraits des documents")
-    for doc in docs_data:
-        with st.expander(f"Afficher le texte de {doc['nom']}"):
-            st.text(doc["texte"])
-            file_name_txt = doc["nom"].replace(".pdf", ".txt")
-            st.download_button(
-                label="📥 Télécharger le texte brut",
-                data=doc["texte"],
-                file_name=file_name_txt,
-                mime="text/plain"
-            )
+                        st.success("✅ Données extraites avec succès !")
+                        st.json(data_finale)
 
-    # Détection des documents valides (au moins salaire + mois/période)
-    valid_docs = [
-        doc for doc in docs_data
-        if validate_data_for_comparison(doc["data"])
-    ]
+                        save_to_db(data_finale)
 
-    st.write(f"📊 **Documents valides détectés :** {len(valid_docs)}")
+                        st.info(f"📈 Mensualité max : **{mensualite} €**")
+                        st.info(f"🏦 Montant max empruntable sur {loan_years} ans : **{montant_total} €**")
 
-    if len(valid_docs) >= 2:
-        doc1 = valid_docs[0]
-        doc2 = valid_docs[1]
+                    except (ValueError, TypeError):
+                        st.warning("⚠️ Salaire manquant ou invalide, calcul non effectué.")
+                else:
+                    st.error("❌ Échec de l'extraction pour ce fichier.")
 
-        st.success("✅ Deux documents comparables détectés. Analyse en cours...")
-
-        result = compare_documents(doc1["data"], doc2["data"])
-
-        st.subheader("🧠 Résultat de la comparaison")
-        st.markdown(f"**Analyse :** {result}")
-
-        st.subheader("📌 Preuves détectées :")
-        for i, doc in enumerate([doc1, doc2], start=1):
-            st.markdown(f"### 📄 Document {i} ({doc['nom']})")
-            st.markdown(f"- **Montant détecté :** `{doc['data'].get('salaire_net') or doc['data'].get('montant_recu') or 'N/A'}`")
-            st.markdown(f"- **Période :** `{doc['data'].get('mois', 'N/A')}`")
-    else:
-        st.warning("⚠️ Au moins deux documents valides sont nécessaires pour la comparaison. Veuillez vérifier les données extraites.")
+            except Exception as e:
+                st.error(f"❌ Erreur lors du traitement : {e}")
