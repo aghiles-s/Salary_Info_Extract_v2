@@ -43,6 +43,7 @@ pydantic==2.11.5
 pydantic_core==2.33.2
 pydeck==0.9.1
 Pygments==2.19.1
+PyMuPDF==1.26.0
 PyPDF2==3.0.1
 pytesseract==0.3.13
 python-dateutil==2.9.0.post0
